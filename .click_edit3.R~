@@ -1,0 +1,547 @@
+#Adriano Fantini May 2016
+#afantini@ictp.it
+
+####################### NOTES
+
+{## MAIN TODO:
+#FIX THE readline() calls, substitute them with on-display input
+#Check for better plot3d methods, I don't like rgl.
+}
+
+{## TODO:
+#DO THIS: https://stackoverflow.com/questions/15272916/how-to-wait-for-a-keypress-in-r, METHOD 3, fantastic! yOU NEED: X11(type="Xlib")
+#Button to fill all zoomed are with NA
+#set_options() function
+#Input/output options implementation (probably within the set_options() function, to edit filenames etc.)
+#Undo working multiple times! You could use lists like for zoom
+#MAIN CONCERN RIGHT NOW: https://github.com/gaborcsardi/keypress/issues/2... says resolved, but...
+#Another MAIN CONCERN: when moving with arrows, replotting each time is SLOW. Can I avoid replotting?
+#Option to Overlay map
+#If you INTERP on a point with an NA near, it becomes NA.
+#function to toggle contour lines on/off (slower)
+#Some automatic functions to fix problematic points, such as sinks/holes
+#Write license, cc-by-sa?
+#possibly, input method with F1, F2... function buttons?
+#Insert possibility to edit/write non lat-lon files. That's easy, but you need the CRS for those files
+#Maybe keep the color scale fixed for ZOOMS?
+#For the zoom, consider using the ext= parameter to plot() instead of the current implementation. This WILL be slower tho.
+#Startup logo while packages load
+#Enable multi-layer files and enable reading time series for given point / hist for given layer
+}
+
+{## PROBLEMS:
+#It would be best to use getGraphicsEvent() instead of keypress(block=TRUE), because this would allow graphic-only interaction (remember to use X11(type="Xlib") to init graphic device, or it doesn't work)
+#If you keep "up" pressed, it recalls previous lines, and that's wrong
+#Create a shiny app!!
+}
+
+####################### START PROGRAM
+
+{## OPTIONS
+  #Graphic options
+  lit3d		= TRUE	    	#If the RGL 3d surface image should or shouldn't be lit. Default TRUE
+  smooth3d	= TRUE	    	#If the RGL 3d surface image should be color smoothed. Default TRUE
+  mapcolors	= rev(topo.colors(255))#Colors for plots
+  colNA           = "Grey"        #Color for NA values
+  pointcolor	= "red"	    	#Color for the selected point indicator. Can be HEX (e.g. "#A2B4C6")
+  pointshape      = "+"           #Point indicator type
+  pointscale      = NA            #EXPERIMENTAL: Scale value for the selected point indicator
+                                  #If NA no scaling is done, and it works fine for most domains. Default NA
+  print_to_term	= FALSE	    	#Print to terminal the value of the current selected point? Default FALSE
+  useRaster       = FALSE          #See ?raster::plot . On some systems FALSE is faster.
+
+  #Edit options
+  interp_adjacent	= 8		#How to identify adjacent cells to interpolate: see ?raster::adjacent. Default 8
+  interp_itself	= FALSE		#Use also the value of the selected point for interpolation,
+                                  # or only neighbours? Default FALSE
+  delta		= 0.1	    	#Percentage of value to be added/subtracted on +/- operations
+
+  #Input options
+  inputpath	= "./"          #Input file path
+  inputfile	= "grid.t001.nc"#Input file name
+  inputvarname	= "Depth"	#"automatic" works if the file only has 1 variable
+
+  #Output options
+  outputpath	= "./"		#Output file path
+  outputfile	= "outfile"	#Output file name. Program writes in .nc and .DAT. Extension will be ignored
+  outvarname	= "pre"	#Output variable name in the netCDF file
+  outvarunit	= "m"		#Output variable unit in the netCDF file
+  outvarLongname	= "mask"	#Long output variable name in the netCDF file
+  write.output.DAT= FALSE		#Write output in .DAT ASCII format?
+  write.output.NC	= TRUE		#Write output in .NC ASCII format?
+
+  #How to treat negative values, zeros, NAs?
+  le.zero.value   = NA            #Value to set to all cells <= 0. Default NA, which makes clearer AND FASTER plots.
+  save.na.as.0    = FALSE          #At saving time, should NA be set to 0? Default TRUE
+
+  #Conversion values. Note: if you change these you may want to change the color scale.
+  plotconversion	= 1		#Constant to multiply values for when plotting (usually 1 or -1, default 1 or NA)
+  read.multiply   = 1		#Constant to multiply values for when reading the file. Default 1 or NA, which is the same
+  save.multiply   = 1		#Constant to multiply values for when saving  the file. Default 1 or NA, which is the same
+}## END OPTIONS
+
+{## INIT
+  check_package <- function(pname) {#Check if a package is installed, else install it (and load it)
+  fail <- FALSE
+  if (!(pname %in% rownames(installed.packages()))) {
+          a <- readkeygraph(paste0("Install ", pname, "? Please confirm  by pressing [Enter]"), paste0("Package ", pname, " was not found. I'll install it now if you press [Enter]. Ctrl+C will stop the program."))
+          if ( a == "\r") {
+            install.packages(pkgs=pname,repos="http://cran.r-project.org", quiet=TRUE)
+          } else {
+            warning("Package ", pname, " is required.")
+            fail <- TRUE
+          }
+      }
+  if (!fail) {
+    library(pname, character.only=TRUE)
+  }
+  return(fail)
+  }
+
+  library("tools")	  #for file_path_sans_ext() #Included in base R
+  library("grDevices")	  #for {record,replay}Plot() #Included in base R
+  check_package("ncdf4")
+  check_package("gdata")
+  check_package("raster")
+
+  #Example raster file for testing
+  # r <- raster(system.file("external/test.grd", package="raster"))
+
+  #READ input file
+  if(inputvarname != "automatic") {
+          r <- raster(paste0(inputpath, inputfile), varname=inputvarname)
+          } else {
+          r <- raster(paste0(inputpath, inputfile))
+          }
+  if (read.multiply != 1 & !is.na(read.multiply)) {r <- r * read.multiply; message("Set multiplication constant ", read.multiply)}
+
+  r[Which(r<=0, cell=T)] <- le.zero.value #Set all cells <=0 to a given constant
+
+  l <- list(r)
+  saved 	 = TRUE  #Init some variables
+  writeopt = "nothing"
+  a 	 = "nothing"
+  selected = NULL
+  outputfile <- file_path_sans_ext(outputfile)
+  output <- paste0(outputpath, outputfile)
+  output.nc <- paste0(outputpath, outputfile, ".nc")
+  output.dat <- paste0(outputpath, outputfile, ".dat")
+}## END INIT
+
+
+{## FUNCTIONS
+  close_all_graphics <- function() {#Try to close all graphical windows open
+    try(graphics.off(), silent=TRUE)
+    try(rgl.off(), silent=TRUE)
+  }
+
+  save.impossible <- function(nc=write.output.NC, dat=write.output.DAT) nc & dat #Check if saving is possible
+
+  round.to <- function(x, k) format(round(x, k), nsmall=k) #Shorthand to round value
+
+  write.DAT <- function(ras, oname) write.fwf(as.data.frame(values(flip(ras, "y"))), file=paste0(oname, ".DAT"), colnames=FALSE, sep=" ", width=8, nsmall=2) #.DAT Output is truncated, not rounded, for speed
+
+  write.NC <- function(ras, oname) writeRaster(ras, paste0(oname, ".nc"), overwrite=TRUE, varname=outvarname, unit=outvarunit, longname=outvarLongname)
+
+  write.files <- function(ras, oname) {
+      if (write.output.DAT == TRUE) {write.DAT(ras, oname); message("Saved as\t", oname, ".DAT\n")}
+      if (write.output.NC  == TRUE) {write.NC( ras, oname); message("Saved as\t", oname, ".nc\n")}
+  }
+
+  replot <- function(ras, point=selected, replot=TRUE) { #replot the map, add selected point, print title with selected point value
+  #     if (replot==TRUE) { #Commented, see below.
+          if (useRaster == FALSE)    par(bg = colNA) #Using colNA=colNA otherwise
+          #NOTE: on some systems useRaster=FALSE is faster!
+          if (plotconversion == 1 | is.na(plotconversion)) {
+              plot(ras,                col=mapcolors, colNA=colNA, useRaster=useRaster)
+          } else {
+              plot(ras*plotconversion, col=mapcolors, colNA=colNA, useRaster=useRaster)
+          }
+  #         assign("savedplot", recordPlot() )
+      #This is a hack for faster plotting. This way the system doesn't have to recalculate the plotting each time. However, recalculating seems to be faster on my machine... at least for small areas. For this reason I'm commenting this out.
+  #     } else {
+  #         replayPlot(savedplot)
+  #     }
+      if (!is.null(point)) {
+          title(paste0("Point selected:\n", "X = ", round.to(point[3], 3), " ; Y = ", round.to(point[4], 3), " ; Value = ", round.to(point[5], 2)))
+          plot_selected(point)
+          if (print_to_term) {print(point)}
+      } else {
+          title(paste0("Point selected:\n", "NULL"))
+      }
+  }
+
+  rp <- function() { #shorthand function to point at the current selected (most zoomed) layer
+      return(l[[length(l)]])
+  }
+
+  plot_selected <- function(s) { #shorthand function to indicate the selected point
+      #Any valid R point type is OK
+      #There is some experiemntal size adjustment done for the point size based on the zoom
+      if (is.na(pointscale)) {
+          points(x = s[3], y = s[4], col = pointcolor, pch = pointshape, cex = 1.3 )
+      } else {
+          points(x = s[3], y = s[4], col = pointcolor, pch = pointshape, cex = mean(cxy / par("cxy"))*pointscale )
+      }
+  }
+
+  clicker <- function(ras) {#This lets you click endlessly and stop when you select a point outside the plot
+  selected.old <<- selected
+  message("Please click the desired point. Click outside the plot when you want to exit from this mode.")
+  exit=FALSE
+  selected <- NULL
+  while (!exit) {
+      c <- click(rp(), n=1, cell=TRUE, xy=TRUE, show=FALSE)
+      if (is.null(c)) {
+          exit=TRUE
+      } else {
+          select <- cbind(Row=rowFromY(r, c$y), Col=colFromX(r, c$x), X=c$x, Y=c$y, Val=c$value)
+          replot(rp(), point=select, replot=FALSE)
+      }
+  }
+  assign("selected", select, envir=.GlobalEnv)
+  message("Selected new point. Waiting for input.")
+  }
+
+  mover <- function(press) { #move around the plot (usually with the keyboard)
+      selected.old <<- selected
+      if (!is.null(selected)) { #if we have a point selected
+          switch(	press,
+                  "left"  = {rinc = -1; cinc=0},
+                  "down"  = {rinc = 0 ; cinc=1},
+                  "right" = {rinc = 1; cinc=0},
+                  "up"    = {rinc = 0 ; cinc=-1}
+                  )
+          row <- selected[1]+cinc
+          col <- selected[2]+rinc
+          selected <<- cbind(Row=row, Col=col, X=xFromCol(r, col), Y=yFromRow(r, row), Val=r[row, col])
+          replot(rp(), replot=FALSE)
+      } else { #If no point is selected, select the center point for this view
+          row <- round(dim(rp())[1]/2)
+          col <- round(dim(rp())[2]/2)
+          x <- xFromCol(rp(), col)
+          y <- yFromRow(rp(), row)
+          row <- rowFromY(r, y)
+          col <- colFromX(r, x)
+          selected <<- cbind(Row=row, Col=col, X=x, Y=y, Val=r[row, col])
+          replot(rp(), replot=FALSE)
+      }
+  }
+
+  zoomer <- function() {#Zoom zoom
+      message("Click twice to set the top-left and bottom-right corner of the selected box\n")
+      l[[length(l)+1]] <<- select(rp())
+      replot(rp())
+      message("Zoomed. Waiting for input.")
+  }
+
+  unzoomer <- function() {#Well, unzoom, lady
+      if (length(l) > 1) {
+      l[[length(l)]] <<- NULL  #remove last element from list of views
+      replot(rp())
+      message("Unzoomed. Waiting for input.")
+      } else {
+      message("Nothing to unzoom from. Waiting for input.")
+      }
+  }
+
+  quitter <- function() {#Things to do on exit
+      a <- readkeygraph("Quit? Please confirm  by pressing [Esc]", "Are you sure you want to quit? Press [Esc] if so, anything else will cancel.")
+      if (!saved & a=="\033") {
+          a <- readkeygraph("Quit *without saving*? Please confirm by pressing [Esc].", "#####    WARNING! There are unsaved modifications!    #####\n Confirm you want to quit by pressing [Esc] again, anything else will cancel.")
+      }
+
+      if ( a == "\033") {assign("quit", TRUE, envir=.GlobalEnv);  close_all_graphics()}
+      if ( a != "\033") {message("Waiting for input")}
+  }
+
+  editor <- function(input = "edit") { #function to edit the value of a single point
+      if (!is.null(selected)) {
+          selected.old <<- selected
+          l.old <<- l
+          if (input == "+") {
+              newval <- selected[5]*(1+delta)
+          } else if (input == "-") {
+              newval <- selected[5]*(1-delta)
+          } else if (input == "zero") {
+              newval <- NA
+          } else {
+              message("Please insert the new value for the selected point.")
+              repeat {
+                  newval <- suppressWarnings(as.numeric(readline()))
+                  if ( !is.na(newval) )  {break}
+                  message("I did not understand your input. Ask yourself why and try again.\n")
+              }
+          }
+          for (i in 1:length(l) ) { #Edit the point in all zoom selections!
+          suppressWarnings(l[[i]][rowFromY(l[[i]],selected[4]),colFromX(l[[i]],selected[3])] <<- newval)
+          }
+          r <<- l[[1]]
+          selected[5] <<- newval
+          message("Point value modified. Waiting for input.")
+          replot(rp())
+          saved <<- FALSE
+      } else {
+          a <<- "nothing"
+          message("Sorry, no point is currently selected. Waiting for input.")
+      }
+  }
+
+  genName <- function(name) { #shorthand to generate the incremental output file names
+      i=1
+      repeat {
+          outname <- paste0(file_path_sans_ext(name), "_", i, ".nc")
+          if (!file.exists(outname)) break
+          i=i+1
+      }
+      return(file_path_sans_ext(outname))
+  }
+
+  saver <- function() { #Well, function to save the file, right?
+      if (save.impossible()) {
+          message()
+          a <- readkeygraph("Conficting options. See terminal.",
+          "#####     Output to netCDF and DAT files are both disabled. Saving to file is disabled! Press:
+          [Enter] . . . enable saving on both .DAT and .NC files
+          d . . . . . . enable saving on .DAT
+          n . . . . . . enable saving on .NC
+          [other] . . . cancel file saving")
+          switch(	a,                  #Key bindings can be changed here, but remember to change the message above too
+                          "\n" = {write.output.NC <<- TRUE; write.output.DAT <<- TRUE},
+                          d    = {write.output.DAT <<- TRUE},
+                          n    = {write.output.NC <<- TRUE},
+                          {message("Waiting for input."); return()})
+      }
+      r <- l[[1]] #The file to save is the first layer
+      if (save.multiply != 1 & !is.na(save.multiply)) {r <- r * save.multiply; message("Set multiplication constant ", save.multiply)}
+      if (save.na.as.0) r[Which(is.na(r), cell=T)] <- 0 #Set NAs to zero
+      if ((file.exists(output.nc) & write.output.NC) | (file.exists(output.dat) & write.output.DAT)) {
+          if (writeopt == "over") {          #Overwrite output file(s)
+              write.files(r, output)
+          } else if (writeopt == "incr") {   #Incremental output file(s)
+              write.files(r, genName(output))
+          } else {
+                  message("Defined output file:\t", output,"{.nc, .DAT}")
+                  message("An output file already exists. What do you want to do?
+                  Press:
+                  o . . . . . . overwrite file
+                  p . . . . . . as 'o', and remember this option for future saves
+                  n . . . . . . write on another file with incremental file name
+                  m . . . . . . as 'n', and remember this option for future saves
+                  [other] . . . cancel file saving")
+                  a <- keypress(block=TRUE)
+                  saved <<- TRUE
+                  switch(	a,                  #Key bindings can be changed here, but remember to change the message above too
+                          o = {write.files(r,output)},
+                          p = {write.files(r,output); assign("writeopt", "over", envir=.GlobalEnv)},
+                          n = {write.files(r,genName(output))},
+                          m = {write.files(r,genName(output)); assign("writeopt", "incr", envir=.GlobalEnv)},
+                          {saved <<- FALSE; message("Output saving canceled.")})
+              }
+      } else {
+          write.files(r,output)
+      }
+  }
+
+  orig <- function() { #Go back to the original zoom level
+      assign("l", list(l[[1]]), envir=.GlobalEnv)
+      replot(l[[1]])
+      message("Unzoomed to default zoom level. Waiting for input.")
+  }
+
+  pan3d <- function(button=2) { #Function to pan the view taken directly from the RGL manual
+      start <- list()
+      begin <- function(x, y) {
+          start$userMatrix <<- par3d("userMatrix")
+          start$viewport <<- par3d("viewport")
+          start$scale <<- par3d("scale")
+          start$projection <<- rgl.projection()
+          start$pos <<- rgl.window2user( x/start$viewport[3], 1 - y/start$viewport[4], 0.5,
+          projection = start$projection)
+      }
+      update <- function(x, y) {
+          xlat <- (rgl.window2user( x/start$viewport[3], 1 - y/start$viewport[4], 0.5,
+          projection = start$projection) - start$pos)*start$scale
+          mouseMatrix <- translationMatrix(xlat[1], xlat[2], xlat[3])
+          par3d(userMatrix = start$userMatrix %*% t(mouseMatrix) )
+      }
+      rgl.setMouseCallbacks(button, begin, update)
+      cat("Callbacks set on button", button, "of rgl device", rgl.cur(), "\n")
+  }
+
+  view_3d <- function() { #Show 3d map of the (large) raster
+      if ( check_package("rasterVis") || check_package("rgl") ) {# If package loading fails
+        message("Required package not loaded. Cannot perform this action.")
+        return()
+      }
+      close_all_graphics()
+
+      if (plotconversion == 1) {
+          rasterVis::plot3D(rp()*(-1), col=mapcolors, lit=lit3d, smooth=smooth3d, rev=TRUE)
+      } else {
+          rasterVis::plot3D((-plotconversion)*rp(), col=mapcolors, lit=lit3d, smooth=smooth3d, rev=FALSE)
+      }
+      title3d(main="To proceed, close window when done")
+      par3d(windowRect = c(0,0,500,500))
+      pan3d()
+      message("Plotted 3D surface.")
+      while(rgl.cur()!=0) { #New way: wait for device to close
+        Sys.sleep(0.2)
+      }
+#Old way
+#      #The following keeps the RGL window open and you can play with it, then close it and the program will continue
+#       try(play3d(function(time) {Sys.sleep(0.01); list()} ), silent=TRUE)
+      #Replot.
+      X11(type="Xlib", family="Arial") #Necessary for the new on-graphic event handler getGraphicsEvent
+      replot(rp())
+      message("Closed 3d view. Waiting for input.")
+  }
+
+  interpolator <- function() { #interpolate the value of the point (excluded) with neighbours
+      if (!is.null(selected)) {
+          selected.old <<- selected
+          l.old <<- l
+          newval <- mean(r[adjacent(r, cellFromXY(r, c(selected[3], selected[4])), pairs=FALSE, directions=interp_adjacent, include=interp_itself)], na.rm=TRUE)
+          for (i in 1:length(l) ) {
+              suppressWarnings(l[[i]][rowFromY(l[[i]],selected[4]),colFromX(l[[i]],selected[3])] <<- newval)
+          }
+          saved <<- FALSE
+          selected[5] <<- newval
+          replot(rp())
+          message("Interpolated around selected point. Waiting for input.")
+      } else {
+          a <<- "nothing"
+          message("Sorry, no point is currently selected. Waiting for input.")
+      }
+  }
+
+  undo <- function() {#Function to undo. Works for the last action only.
+      if (!exists("a.old")) {message("Nothing to undo. Waiting for input."); break}
+      if (!exists("selected.old")) selected.old <- NA
+      if (!exists("l.old")) l.old <- NA
+      switch(a.old,
+          "click" = {selected <<- selected.old; message("Point selection reverted. Waiting for input.")},
+          "edit" = {selected <<- selected.old; l <<- l.old; replot(rp()); message("Point modification reverted. Waiting for input.")},
+          "interp" = {selected <<- selected.old; l <<- l.old; replot(rp()); message("Point interpolation reverted. Waiting for input.")},
+          message("Nothing to undo. Waiting for input."))
+  }
+
+  helper <- function() {#Print HELP
+  cat("Commands:
+
+  H                 H     Print this HELP
+  [Space]           3     SELECT points by clicking (click outside the plot box to stop)
+  [Arrow]         4268    MOVE selected point around the plot
+  Z                 7     ZOOM
+  X                 9     UNZOOM
+
+  E                 5     EDIT value of selected point
+  A                 +     ADD", delta*100, "% to the selected point
+  S                 -     SUBTRACT", delta*100, "% to the selected point
+  I                 0     INTERPOLATE around selected point
+  N                 *     Set point to NA / zero
+
+  V                 1     VIEW 3D model of the surface
+  W              [Enter]  WRITE output file to disk
+  [Backspace]       /     UNDO last point selection, modification or interpolation
+  [Esc]           [Esc]   Go back to default zoom level, or EXIT from there
+
+  NOTE:
+  If 'click_edit' crashes and you want to save the file anyway, just call the saver function:
+  saver()
+  \n"
+  )
+  }
+
+  keybindings <- function(key) { #Keybindings. You can modify them, add them, whatever!
+  switch(	key, #Arrows are hardcoded to "left", "down", "right", "up", but potentially you could insert them here
+          "4"        = {newkey = "left"},#Numpad commands
+          "2"        = {newkey = "down"},
+          "6"        = {newkey = "right"},
+          "8"        = {newkey = "up"},
+          "5"        = {newkey = "edit"},
+          "0"        = {newkey = "interp"},
+          "1"        = {newkey = "view3d"},
+          "\n"       = {newkey = "write"},
+          "7"        = {newkey = "zoom"},
+          "9"        = {newkey = "unzoom"},
+          "/"        = {newkey = "undo"},
+          "*"        = {newkey = "zero"},
+          "3"        = {newkey = "click"},
+          " "        = {newkey = "click"},#Keyboard commands
+          "z"        = {newkey = "zoom"},
+          "x"        = {newkey = "unzoom"},
+          "\b"       = {newkey = "undo"},
+          "e"        = {newkey = "edit"},
+          "w"        = {newkey = "write"},
+          "i"        = {newkey = "interp"},
+          "\177"     = {newkey = "undo"},
+          "v"        = {newkey = "view3d"},
+          "n"        = {newkey = "zero"},
+          "h"        = {newkey = "help"},#Common commands
+          "a"        = {newkey = "+"},
+          "s"        = {newkey = "-"},
+          "\033"     = {newkey = "quit"},
+                       {newkey = key})#Else, just pass on the registered key
+  return(newkey)
+  }
+
+  readkeygraph <- function(gfxPrompt="Waiting for input       [H] for help", consolePrompt="") {#Function for on-graph input
+      getGraphicsEvent(prompt = gfxPrompt,
+                  onMouseDown = NULL, onMouseMove = NULL,
+                  onMouseUp = NULL, onKeybd = onKeybd,
+                  consolePrompt = consolePrompt)
+      Sys.sleep(0.01)
+      return(keyPressed)
+  }
+
+  onKeybd <- function(key) {
+      keyPressed <<- key
+  }
+
+}## END FUNCTIONS
+
+{## MAIN program
+  quit=FALSE
+  close_all_graphics()
+  X11(type="Xlib", family="Arial") #Necessary for the new on-graphic event handler getGraphicsEvent
+  #Arial is selected to overcome a bug...
+  replot(r); cxy = par("cxy") #cxy is needed for the rescaling of the size of the point selection indicator (experimental)
+  cat("#####     Welcome to click_edit!     #####\n")
+  helper()
+  # i=0
+  while (!quit) { #Main loop, the program happens here
+    # if ( (i %% 30) == 0 ) {message("(press h for help)")} #Once in a while, print the help... commented
+    # i=i+1
+    if (a != "help" & a != "unrecognized") {a.old <- a}
+    a  <- keybindings(try(tolower(readkeygraph()), silent=TRUE)) #Switch to lowercaseand translate the input to a command
+    switch(	a,          #Depending on the input, call the right function
+            "click"    = clicker(),
+            "zoom"     = zoomer(),
+            "unzoom"   = unzoomer(),
+            "quit"     = if ( length(l) > 1 ) {orig()} else {quitter()}, #Quit only if you are at zoom level 0
+            "edit"     = editor(),
+            "left"     = mover(a),
+            "down"     = mover(a),
+            "right"    = mover(a),
+            "up"       = mover(a),
+            "write"    = saver(),
+            "interp"   = interpolator(),
+            "view3d"   = view_3d(),
+            "help"     = helper(),
+            "+"        = editor("+"),
+            "-"        = editor("-"),
+            "zero"     = editor("zero"),
+            "undo"     = undo(),
+            {a <- "unrecognized"})#If none of the above
+  }
+}
+
+{## QUIT sequence
+  message("Ok, bye bye!")
+
+  #Delete all the stuff in this section without warnings
+  suppressWarnings(rm(l, selected, selected.old, a, a.old, quit, mapcolors, interp_adjacent, r, writeopt, saved, delta, cxy, i, output))
+  #Quit
+  #quit(save="no")
+}
